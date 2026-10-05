@@ -11,6 +11,7 @@ import {
   getDependencies,
   getBacklogDescendantIssueIds,
   getBlockedIssueIds,
+  getDeliveredIssueIds,
   getCacheInfo,
   getDisplayId,
   resolveIssueLocalId,
@@ -84,6 +85,7 @@ export const readyCommand = new Command("ready")
   .option("-l, --limit <count>", "Show at most this many issues")
   .option("--under <issue>", "Show only ready descendants of an issue")
   .option("--epic <issue>", "Alias for --under")
+  .option("--delivered", "List delivered-but-untransitioned issues (excluded from ready)")
   .option("--sync", "Force sync before listing")
   .option("--style <style>", `Human output style: ${HUMAN_OUTPUT_STYLE_CHOICES.join(", ")}`)
   .option("--team <team>", "Team key (overrides config)")
@@ -137,9 +139,48 @@ export const readyCommand = new Command("ready")
       // Filter to open issues that are not blocked
       const blockedIds = getBlockedIssueIds();
       const backlogDescendantIds = getBacklogDescendantIssueIds();
+      const deliveredIds = getDeliveredIssueIds();
       let scopedIssues = hierarchyIssueIds
         ? allIssues.filter((issue) => hierarchyIssueIds.has(issue.id))
         : allIssues;
+
+      // --delivered: surface delivered-but-untransitioned beads (MG-1207)
+      if (options.delivered) {
+        const deliveredIssues = scopedIssues
+          .filter((i) => deliveredIds.has(i.id) && !isTerminalStatus(i.status))
+          .sort((a, b) => {
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+          });
+        const visibleDelivered = limit ? deliveredIssues.slice(0, limit) : deliveredIssues;
+        if (options.json) {
+          output(formatReadyJson(visibleDelivered, getDependencies));
+          return;
+        }
+        if (visibleDelivered.length === 0) {
+          output("No delivered-but-untransitioned issues.");
+          return;
+        }
+        const lines = visibleDelivered.map((issue) => {
+          const deps = getDependencies(issue.id);
+          const parentDep = deps.find((d) => d.type === "parent-child");
+          return {
+            ...issue,
+            display_id: getDisplayId(issue.id),
+            parent_display_id: parentDep ? getDisplayId(parentDep.depends_on_id) : null,
+          };
+        });
+        output(formatReadyHuman(lines));
+        output(
+          "(delivered via marker — advance status with `lb close <id>` or `lb update <id> --status <status>`; remove with `lb comment` only if mis-delivered)"
+        );
+        if (visibleDelivered.length < deliveredIssues.length) {
+          output(
+            `(showing ${visibleDelivered.length} of ${deliveredIssues.length} delivered issues; use --limit to adjust)`
+          );
+        }
+        return;
+      }
 
       // Filter by assignee unless --all (skip in local-only mode)
       if (!options.all && !localOnly && !remoteDisabled) {
@@ -159,8 +200,15 @@ export const readyCommand = new Command("ready")
           isReadyStatus(i.status) &&
           !blockedIds.has(i.id) &&
           !backlogDescendantIds.has(i.id) &&
+          !deliveredIds.has(i.id) &&
           !hasOpenChildWork(i.id)
       );
+      const deliveredExcludedCount = scopedIssues.filter(
+        (i) =>
+          deliveredIds.has(i.id) &&
+          (isReadyStatus(i.status) || i.status === "in_progress") &&
+          !isTerminalStatus(i.status)
+      ).length;
 
       // MG-1207: delivery-evidence filter — a merged PR whose body carries
       // "Part of MG-x"/"Closes MG-x" means the bead is delivered but stays
@@ -221,6 +269,7 @@ export const readyCommand = new Command("ready")
                   (issue) =>
                     issue.status === "in_progress" &&
                     !backlogDescendantIds.has(issue.id) &&
+                    !deliveredIds.has(issue.id) &&
                     !hasOpenChildWork(issue.id)
                 ),
                 ...readyIssues,
@@ -258,6 +307,11 @@ export const readyCommand = new Command("ready")
           (style === "beads" ? dedupedBeadsIssues.length : visibleReadyDisplayIssues.length) === 0
         ) {
           output("No ready issues.");
+          if (deliveredExcludedCount > 0) {
+            output(
+              `${deliveredExcludedCount} delivered bead(s) excluded — lb ready --delivered to view.`
+            );
+          }
           if (!options.all && !localOnly && !remoteDisabled) {
             output("Hint: ready defaults to issues assigned to you (or unassigned). Try --all.");
             output(`Scope checked: ${getRepoScope()}:${getRepoName() || "unknown"}`);
@@ -289,6 +343,12 @@ export const readyCommand = new Command("ready")
               `(showing ${visibleReadyDisplayIssues.length} of ${totalReadyIssues} ready issues; use --limit to adjust)`
             );
           }
+        }
+
+        if (deliveredExcludedCount > 0) {
+          output(
+            `(${deliveredExcludedCount} delivered bead(s) excluded — lb ready --delivered to view; advance status to clear)`
+          );
         }
 
         // Show stale cache warning if sync failed or cache is old (skip in local-only mode)
