@@ -181,22 +181,52 @@ const QUEUE_UPDATE_SETUP = (assign: string, issueIdVar = "localId") => `
 `;
 
 describe("outbox unresolvable assignee (MG-1665)", () => {
-  test("bare handle resolves via viewer domain and pushes", async () => {
+  test("MG-1665 specimen: handle-form assign is rejected at enqueue, zero rows", async () => {
+    // Mags's live payload shape (2026-10-23): {issueId, status, assign: "<handle>"}
+    // — handle-form was ACCEPTED at enqueue and retried 91x forever (no age
+    // cap, no dead-letter for the closed target). Enqueue now refuses it.
     const { repoDir } = createRepo();
-    const result = await runEval(repoDir, QUEUE_UPDATE_SETUP("lily"));
-
+    const setup = `
+      import { generateLocalId, getOutboxDiagnosticItems, queueOutboxItem } from ${JSON.stringify(DATABASE_UTILS_PATH)};
+      let rejected = "";
+      try {
+        queueOutboxItem("update", { issueId: "MG-1507", status: "Todo", assign: "sylvie" }, generateLocalId());
+      } catch (e) {
+        rejected = String((e && e.message) || e);
+      }
+      console.log(JSON.stringify({ rejected, rows: getOutboxDiagnosticItems().length }));
+    `;
+    const result = await runEval(repoDir, setup);
     expect(result.exitCode).toBe(0);
-    expect(result.stderr).toBe("");
     const payload = JSON.parse(result.stdout);
-    expect(payload.result.success).toBe(1);
-    expect(payload.result.failed).toBe(0);
-    expect(payload.result.dropped).toBe(0);
-    expect(payload.remaining).toEqual([]);
+    expect(payload.rejected).toContain("MG-1665");
+    expect(payload.rejected).toContain("bare handle");
+    expect(payload.rejected).toContain("sylvie");
+    expect(payload.rows).toBe(0);
+  });
+
+  test("assignee field rejects bare handles at enqueue too", async () => {
+    const { repoDir } = createRepo();
+    const setup = `
+      import { generateLocalId, getOutboxDiagnosticItems, queueOutboxItem } from ${JSON.stringify(DATABASE_UTILS_PATH)};
+      let rejected = "";
+      try {
+        queueOutboxItem("update", { issueId: "MG-1", assignee: "beryl" }, generateLocalId());
+      } catch (e) {
+        rejected = String((e && e.message) || e);
+      }
+      console.log(JSON.stringify({ rejected, rows: getOutboxDiagnosticItems().length }));
+    `;
+    const result = await runEval(repoDir, setup);
+    expect(result.exitCode).toBe(0);
+    const payload = JSON.parse(result.stdout);
+    expect(payload.rejected).toContain("assignee");
+    expect(payload.rows).toBe(0);
   });
 
   test("bare handle Linear cannot resolve is dropped, not retried", async () => {
     const { repoDir } = createRepo();
-    const result = await runEval(repoDir, QUEUE_UPDATE_SETUP("ghost-user"));
+    const result = await runEval(repoDir, QUEUE_UPDATE_SETUP("ghost@nowhere.invalid"));
 
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
@@ -245,7 +275,7 @@ describe("outbox unresolvable assignee (MG-1665)", () => {
         updated_at: now,
       });
       setIssueIdMapping(localId, "LIN-1507");
-      queueOutboxItem("update", { issueId: localId, assign: "lily", description: "unchanged" }, localId);
+      queueOutboxItem("update", { issueId: localId, assign: "lily@metrograph.ai", description: "unchanged" }, localId);
       globalThis.fetch = async () => {
         throw new Error("fetch failed");
       };
@@ -285,16 +315,16 @@ describe("outbox unresolvable assignee (MG-1665)", () => {
 
       const purgeA = generateLocalId();
       const purgeB = generateLocalId();
-      updateOutboxItemError(queueOutboxItem("update", { issueId: purgeA, assign: "ghost" }, purgeA), "User not found: ghost");
-      updateOutboxItemError(queueOutboxItem("update", { issueId: purgeB, assign: "ghost" }, purgeB), "User not found: ghost");
+      updateOutboxItemError(queueOutboxItem("update", { issueId: purgeA, assign: "ghost@nowhere.invalid" }, purgeA), "User not found: ghost");
+      updateOutboxItemError(queueOutboxItem("update", { issueId: purgeB, assign: "ghost@nowhere.invalid" }, purgeB), "User not found: ghost");
       const failedBeforePurge = getOutboxRowCount({ failedOnly: true });
       const purged = purgeOutboxItems({ failedOnly: true });
       const remainingAfterPurge = getOutboxRowCount({});
 
       const resetA = generateLocalId();
       const resetB = generateLocalId();
-      updateOutboxItemError(queueOutboxItem("update", { issueId: resetA, assign: "ghost" }, resetA), "User not found: ghost");
-      updateOutboxItemError(queueOutboxItem("update", { issueId: resetB, assign: "ghost" }, resetB), "User not found: ghost");
+      updateOutboxItemError(queueOutboxItem("update", { issueId: resetA, assign: "ghost@nowhere.invalid" }, resetA), "User not found: ghost");
+      updateOutboxItemError(queueOutboxItem("update", { issueId: resetB, assign: "ghost@nowhere.invalid" }, resetB), "User not found: ghost");
       const reset = resetOutboxRetryCounts({ failedOnly: true });
       const afterReset = getOutboxDiagnosticItems().map((item) => ({
         retry_count: item.retry_count,
@@ -303,7 +333,7 @@ describe("outbox unresolvable assignee (MG-1665)", () => {
       const remainingAfterReset = getOutboxRowCount({});
 
       const scoped = generateLocalId();
-      updateOutboxItemError(queueOutboxItem("update", { issueId: scoped, assign: "ghost" }, scoped), "User not found: ghost");
+      updateOutboxItemError(queueOutboxItem("update", { issueId: scoped, assign: "ghost@nowhere.invalid" }, scoped), "User not found: ghost");
       const scopedRemoved = purgeOutboxItems({ failedOnly: true, issueId: scoped });
       const remainingAfterScoped = getOutboxRowCount({});
 
@@ -354,7 +384,7 @@ describe("outbox unresolvable assignee (MG-1665)", () => {
       } from ${JSON.stringify(DATABASE_UTILS_PATH)};
 
       const localId = generateLocalId();
-      const id = queueOutboxItem("update", { issueId: localId, assign: "ghost" }, localId);
+      const id = queueOutboxItem("update", { issueId: localId, assign: "ghost@nowhere.invalid" }, localId);
       updateOutboxItemError(id, "User not found: ghost");
     `;
     const result = await runInlineCli(
@@ -379,12 +409,64 @@ describe("outbox unresolvable assignee (MG-1665)", () => {
       } from ${JSON.stringify(DATABASE_UTILS_PATH)};
 
       const localId = generateLocalId();
-      const id = queueOutboxItem("update", { issueId: localId, assign: "ghost" }, localId);
+      const id = queueOutboxItem("update", { issueId: localId, assign: "ghost@nowhere.invalid" }, localId);
       updateOutboxItemError(id, "User not found: ghost");
     `;
     const result = await runInlineCli(repoDir, ["linear", "outbox", "purge"], setup);
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Would purge 1 outbox row(s)");
+  });
+
+  test("retry cap dead-letters non-rate-limited rows; rate-limited exempt (MG-1665)", async () => {
+    const { repoDir } = createRepo();
+    const setup = `
+      import {
+        generateLocalId,
+        getOutboxDiagnosticItems,
+        queueOutboxItem,
+        updateOutboxItemError,
+      } from ${JSON.stringify(DATABASE_UTILS_PATH)};
+
+      const localId = generateLocalId();
+      const stuck = queueOutboxItem("update", { issueId: localId, assign: "ghost@nowhere.invalid" }, localId);
+      for (let i = 0; i < 11; i++) {
+        updateOutboxItemError(stuck, "User not found: ghost@nowhere.invalid");
+      }
+
+      const rlLocal = generateLocalId();
+      const rl = queueOutboxItem("update", { issueId: rlLocal, status: "Todo" }, rlLocal);
+      updateOutboxItemError(rl, "API rate limit exceeded, retry after 60");
+
+      const items = getOutboxDiagnosticItems().map((it) => ({
+        retry_count: it.retry_count,
+        last_error: it.last_error || null,
+        next_attempt_at: it.next_attempt_at ?? null,
+      }));
+      console.log(JSON.stringify({ items }));
+    `;
+    const result = await runEval(repoDir, setup);
+    expect(result.exitCode).toBe(0);
+    const payload = JSON.parse(result.stdout);
+    const capped = payload.items[0];
+    const rateLimited = payload.items[1];
+    expect(capped.retry_count).toBe(11);
+    expect(capped.next_attempt_at).toBeNull();
+    expect(capped.last_error).toContain("dead-letter (MG-1665): retry cap 10 exceeded");
+    expect(rateLimited.next_attempt_at).not.toBeNull();
+    expect(rateLimited.last_error).not.toContain("dead-letter");
+  });
+
+  test("email-form assignee strings are accepted at enqueue (contract: email or me)", async () => {
+    const { repoDir } = createRepo();
+    const setup = `
+      import { generateLocalId, getOutboxDiagnosticItems, queueOutboxItem } from ${JSON.stringify(DATABASE_UTILS_PATH)};
+      queueOutboxItem("update", { issueId: "MG-2", assign: "lily@metrograph.ai" }, generateLocalId());
+      queueOutboxItem("update", { issueId: "MG-3", assign: "me" }, generateLocalId());
+      console.log(JSON.stringify({ rows: getOutboxDiagnosticItems().length }));
+    `;
+    const result = await runEval(repoDir, setup);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).rows).toBe(2);
   });
 });
