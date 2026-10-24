@@ -24,6 +24,7 @@ import {
   outputError,
 } from "../utils/output.js";
 import { getViewer } from "../utils/issue-backend.js";
+import { fetchMergedBeadRefs } from "../utils/merged-bead-refs.js";
 import {
   getHumanOutputStyle,
   getRepoName,
@@ -160,6 +161,35 @@ export const readyCommand = new Command("ready")
           !backlogDescendantIds.has(i.id) &&
           !hasOpenChildWork(i.id)
       );
+
+      // MG-1207: delivery-evidence filter — a merged PR whose body carries
+      // "Part of MG-x"/"Closes MG-x" means the bead is delivered but stays
+      // open through the staging window (rule 15); ready must not serve it
+      // (2026-08-25: 9/13 audited candidates already delivered, three
+      // burned dispatch cycles, duplicate-claim risk across instances).
+      // Skipped in local-only mode (offline contract — no gh/network).
+      // Failure is loud + serving continues unfiltered: stale-visible beats
+      // both a hard failure and a silent fallthrough (the original defect).
+      if (!localOnly && readyIssues.length > 0) {
+        const { refs, error } = fetchMergedBeadRefs();
+        if (error) {
+          outputError(
+            `! delivery-filter unavailable (${error}) — serving ready UNFILTERED; delivered beads may appear (MG-1207)`
+          );
+        } else if (refs.size > 0) {
+          const beforeCount = readyIssues.length;
+          readyIssues = readyIssues.filter((i) => {
+            const gid = getDisplayId(i.id);
+            return !(gid && refs.has(gid.toUpperCase()));
+          });
+          const hiddenCount = beforeCount - readyIssues.length;
+          if (hiddenCount > 0) {
+            outputError(
+              `note: ${hiddenCount} delivered bead(s) hidden from ready (merged PR found — MG-1207)`
+            );
+          }
+        }
+      }
 
       // Sort by priority, then updated_at
       readyIssues.sort((a, b) => {
